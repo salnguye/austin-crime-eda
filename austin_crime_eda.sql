@@ -1,17 +1,18 @@
-/* Total rows */
-SELECT count(*)
-FROM austin_crime;
+/*--------------------------------------- Data validation --------------------------------------------*/
+-- 1. Confirm columns and data types
+select column_name,
+	data_type,
+	udt_name
+from information_schema.columns
+where table_schema = 'public'
+	and table_name = 'austin_crime';
 
-/* Validate if the incident number is unique */
-SELECT incident_number,
-	count(*)
-FROM austin_crime
-GROUP BY incident_number
-HAVING count(*) > 1;
+-- 2. Total rows inserted
+select count(*)
+from austin_crime;
 
-/* Doing a data sanity check */
--- 1. Comparing the total row count and non-null counts of each column
-SELECT count(*) as row_count,
+-- 3. Comparing the total row count and non-null counts of each column
+select count(*) as row_count,
 	count(incident_number) as incident_number,
 	count(highest_offense_description) as highest_offense_description,
 	count(highest_offense_code) as highest_offense_code,
@@ -39,10 +40,10 @@ SELECT count(*) as row_count,
 	count(latitude) as latitude,
 	count(longitude) as longtidue,
 	count(location) as location
-FROM austin_crime;
+from austin_crime;
 
--- 2. Validating categorial data
-SELECT count(distinct highest_offense_code) as highest_offense_code,
+-- 4. Validating distinct counts
+select count(distinct highest_offense_code) as highest_offense_code,
 	count(distinct highest_offense_description) as highest_offense_description,
 	count(distinct family_violence) as family_violence,
 	count(distinct clearance_status) as clearance_status,
@@ -52,212 +53,359 @@ SELECT count(distinct highest_offense_code) as highest_offense_code,
 	count(distinct council_district) as council_district,
 	count(distinct apd_sector) as apd_sector,
 	count(distinct apd_district) as apd_district
-FROM austin_crime;
+from austin_crime;
 
--- 3. Validating the range of specific columns
-SELECT min(length(zip_code::text)::int) as min_length_zip,
+-- 5. Validating range in values
+select min(length(zip_code::text)::int) as min_length_zip,
 	max(length(zip_code::text)::int) as max_length_zip,
-	min(report_date) as max_report_date,
-	max(report_date) as max_report_date,
+	min(report_date) as max_report_date_time,
+	max(report_date) as max_report_date_time,
 	min(occurred_date_time) as min_occurred_date_time,
 	max(occurred_date_time) as max_occurred_date_time,
-	min(occurred_date) as min_occurred_date,
-	max(occurred_date) as max_occurred_date,
 	min(clearance_date) as min_clearance_date,
 	max(clearance_date) as max_clearance_date
-FROM austin_crime;
+from austin_crime;
 
-/* Ratio of cleared cases to reported cases */
-SELECT round(100 * (count(clearance_date)::numeric / count(report_date)), 2) as cleared_report_ratio
-FROM austin_crime;
+--6. Validate if the incident number is unique
+select incident_number,
+	count(*)
+from austin_crime
+group by incident_number
+having count(*) > 1;
 
-/* Top 10 offenses reported */
-SELECT highest_offense_description,
-	COUNT(*) as total
-FROM austin_crime
-GROUP BY 1
-ORDER BY 2 DESC
-LIMIT 10;
+--7. Validating discrepencies between clearance date and clearance status 
+select count(*) as clearance_date_na,
+	(select count(*) from austin_crime where clearance_date is not null and clearance_status is null) as status_na
+from austin_crime
+where clearance_date is null and clearance_status is not null;
 
-/* Total incidents by location */
-SELECT location_type,
+-- 8. Number of incidents with a "Not cleared" status and has a clearance date
+select count(*)
+from austin_crime
+where clearance_date is not null
+	and clearance_status = 'N';
+
+-- 9. Number of incidents where there's no clearance date/has clearance status, grouped by year reported and occurred
+select extract(year from report_date) as report_year,
+	extract(year from occurred_date) as occurred_year,
+	count(*) as clearance_status_na
+from austin_crime
+where clearance_date is null 
+	and clearance_status is not null
+group by 1, 2;
+
+-- 10. Distinct values for family_violence
+select distinct family_violence
+from austin_crime;
+
+-- 11. Distinct values for location_type
+select distinct location_type
+from austin_crime;
+
+-- 13. Incidents where occurred_date_time is null
+select *
+from austin_crime
+where occurred_date_time is null;
+
+-- 14. Percentage of missing zip codes
+select 100 * (count(*)::decimal/(select count(*) from austin_crime)) as percent_zipcode_missing
+from austin_crime
+where zip_code is null;
+
+-- 15. Zip codes recoverable by address
+select distinct a.address, 
+	a.zip_code
+from austin_crime a inner join (
+	select distinct address,
+		zip_code
+	from austin_crime
+	where zip_code is null) b on a.address = b.address
+where a.zip_code is not null;
+
+-- 16. Confirming row count to update: 1426
+with t1 as (
+select distinct a.address, 
+	a.zip_code
+from austin_crime a inner join (
+	select distinct address,
+		zip_code
+	from austin_crime
+	where zip_code is null) b on a.address = b.address
+where a.zip_code is not null
+)select count(*)
+from austin_crime
+where address in (select distinct address from t1) 
+	and zip_code is null;
+
+/*--------------------------------------- Data cleansing --------------------------------------------*/
+
+-- 17. Update missing zip codes
+update austin_crime a
+set zip_code = b.zip_code
+from austin_crime b
+where a.address = b.address
+and a.zip_code is null
+	and b.zip_code is not null;
+
+-- 18. Create a working dataset as a view with cleansed data
+create or replace view v_atx_crime as
+with median_clearance as (
+-- Calculate the median clearance date by reporting year, month, and type of crime
+select extract(year from report_date) as report_year,
+	extract(month from report_date) as report_month,
+	highest_offense_code,
+	to_char(to_timestamp(percentile_cont(0.5) within group(order by extract (epoch from clearance_date))), 'YYYY-MM-DD')::date as median_clearance_date
+from austin_crime
+group by 1, 2, 3
+)select a.incident_number,
+	highest_offense_description,
+	upper(family_violence) as family_violence,
+	occurred_date,
+	occurred_date_time,
+	report_date,
+	report_date_time,
+	case when clearance_status is not null and clearance_date is null then median_clearance_date else clearance_date end as clearance_date, -- Replace the missing clearance date with the median clearance date if clearance status is not null
+	clearance_status,
+	case clearance_status when 'C' then 'Cleared by Arrest' when 'O' then 'Cleared by Exception' when 'N' then 'Not Cleared' else 'Unknown Status' end as clearance_reason, -- Mapping clearance status codes to clearance status lookup values
+	ucr_category,
+	coalesce(category_description, 'No description') as category_description, -- Fill missing category description with 'No description'
+	coalesce(location_type, 'OTHER / UNKNOWN') as location_type, -- Fill missing location type with 'UNKNOWN'
+	zip_code,
+	latitude,
+	longitude
+from austin_crime a left join median_clearance b on extract(year from report_date) = b.report_year
+	and extract(month from report_date) = b.report_month
+	and a.highest_offense_code = b.highest_offense_code
+where occurred_date_time is not null
+order by report_date;
+
+/*--------------------------------------- Exploratory Analysis --------------------------------------------*/
+
+-- Top 25 offenses reported
+select highest_offense_description,
 	count(*) as total_incidents
-FROM austin_crime
-GROUP BY 1
-ORDER BY 2 DESC;
+from v_atx_crime
+group by highest_offense_description
+order by 2 desc
+limit 25;
 
-/* Total incidents by zip code */
-SELECT zip_code,
+-- Total 25 location types where crimes where committed
+select location_type,
 	count(*) as total_incidents
-FROM austin_crime
-GROUP BY zip_code
-ORDER BY 2 DESC;
+from v_atx_crime
+group by location_type
+order by 2 desc
+limit 25;
 
-/* Number of incidents reported each year in comparison to the previous year */
-SELECT t.*,
+-- Total 25 zip codes where most incidents were reported
+select zip_code,
+	count(*) total_incidents
+from v_atx_crime
+group by zip_code
+order by 2 desc
+limit 25;
+
+-- Percentage of crimes cleared by status
+select clearance_reason,
+	round(100 * (count(*)::decimal/(select count(*) from austin_crime)),0) as percentage
+from v_atx_crime
+group by clearance_reason
+order by 2 desc;
+	
+-- Distribution of incidents reported each year
+select t.*,
 	-- Calculate the percent change from the preceding year
-	round(100 * ((total - lag(total) over(order by year_reported))::numeric / lag(total) over(order by year_reported)),2) as year_percent_change
-FROM (
+	round(100 * ((total - lag(total) over(order by year_reported))::decimal / lag(total) over(order by year_reported)),2) as year_percent_change
+from (
 	-- Count the number of incidents by year
-	SELECT extract(year from report_date) as year_reported,
+	select extract(year from report_date) as year_reported,
 		count(*) as total
-	FROM austin_crime
-	GROUP BY year_reported
+	from v_atx_crime
+	group by year_reported
 ) t;
 
-/* Top 3 crimes reported each year */
-WITH offenses as (
-SELECT extract(year from report_date) as year,
+-- 12 month moving average total crimes reported
+select t.*,
+	round(avg(incident_count) over(order by report_month rows between 11 preceding and current row),2) as moving_avg_12m
+from (
+	select date_trunc('month', report_date)::date as report_month,
+		count(*) as incident_count
+	from v_atx_crime
+	group by 1
+)t ;
+
+-- Distribution of crimes reported by day of the week
+select to_char(report_date, 'DAY') as day,
+	count(*) as reports
+from v_atx_crime
+group by 1, extract(dow from report_date)
+order by extract(dow from report_date);
+
+-- Hour when the most crimes occurred
+select extract(hour from occurred_date_time) as occ_hour,
+	count(*)
+from v_atx_crime
+group by 1
+order by 2 desc;
+
+-- Top 3 crimes committed by reported year
+with offenses as (
+select extract(year from report_date) as year,
 	highest_offense_description,
 	count(*) as total
-FROM austin_crime
-GROUP BY year,
+from v_atx_crime
+group by year,
 	highest_offense_description
-) SELECT *
-FROM (
-	SELECT dense_rank() over(partition by year order by total desc) as rank, -- Use a window function to rank the count of incidents by reporting year
+) select *
+from (
+	select dense_rank() over(partition by year order by total desc) as rank, -- Use a window function to rank the count of incidents by reporting year
 		t.*
-	FROM offenses t
-) WHERE rank <= 3;
+	from offenses t
+) where rank <= 3;
 
-/* Compare the number of cleared incidents to reported incidents each year */
-SELECT extract(year from report_date) as year,
-	count(report_date) as total_reported,
-	count(clearance_date) as total_cleared,
-	round(100 * ((b.total_cleared - a.total_reported)::numeric / a.total_reported), 2) as percent_diff
-FROM austin_crime
-GROUP BY 1;
+-- Ratio of cleared incidents to reported incidents by year reported
+select t.*,
+	round(100 *(total_cleared::decimal/total_reported),2) as cleared_report_ratio
+from (
+	select extract(year from report_date) as year,
+		count(*) as total_reported,
+		sum(case when coalesce(clearance_status, 'N') <> 'N' then 1 else 0 end) as total_cleared
+	from v_atx_crime
+	group by 1
+) t
+order by year;
 
-/* Counting the reasons why a crime was cleared */
-SELECT (case clearance_status when 'C' then 'Arrest' when 'O' then 'Exception' when 'N' then 'Not cleared' else 'No reason provided' end) as clearance_reason, -- Convert the status codes into something more descriptive and count the total incidents by status
+-- Number of incidents by clearance status
+select clearance_reason,
 	count(*) as total
-FROM austin_crime
-GROUP BY 1
-ORDER BY 2 desc;
+from v_atx_crime
+group by clearance_reason
+order by 2 desc;
 
-/* Incidents cleared by the type of crime reported */
-SELECT highest_offense_description,
-	count(*) as total_offenses,
-	sum(case when coalesce(clearance_status, 'N') <> 'N' then 1 else 0 end) as clearance_total
-FROM austin_crime
-GROUP BY 1
-ORDER BY 2 DESC;
+-- Percentage of crimes cleared by year
+select t.*,
+	round(100 * total_cleared::decimal / (total_cleared + not_cleared),2) as percent_cleared
+from (
+	select extract(year from report_date) as year,
+		sum(case when coalesce(clearance_status, 'N') = 'N' then 1 else 0 end) as not_cleared,
+		sum(case when coalesce(clearance_status, 'N') <> 'N' then 1 else 0 end) as total_cleared
+	from v_atx_crime
+	group by 1) t
+order by 1;
 
-/* Crimes committed in Austin that the FBI considered as the highest offense */
-SELECT category_description as ucr_category,
-	count(*)
-FROM austin_crime
-WHERE category_description is not null
-GROUP BY 1
-ORDER BY 2 DESC;
+-- Total incidents by FBI's UCR category and clearance reason
+select t.*,
+	round(100 * (total_incidents / sum(total_incidents) over(partition by fbi_ucr_category)), 2) as percentage
+from (
+	select category_description as fbi_ucr_category, 
+		clearance_reason,
+		count(*) as total_incidents
+	from v_atx_crime
+	where ucr_category is not null
+	group by 1,2
+	order by 1, 3 desc
+) t;
 
-/* Summary of how long it takes to solve a crime from the day it was reported */
-SELECT min(clearance_date - report_date) as min_days
+-- FBI's UCR category over time
+select extract(year from report_date) as report_year,
+	count(*) filter(where category_description = 'Aggravated Assault') as aggrevated_assault,
+	count(*) filter(where category_description = 'Auto Theft') as auto_theft,
+	count(*) filter(where category_description = 'Burglary') as burglary,
+	count(*) filter(where category_description = 'Murder') as murder,
+	count(*) filter(where category_description = 'Rape') as rape,
+	count(*) filter(where category_description = 'Robbery') as robbery,
+	count(*) filter(where category_description = 'Theft') as theft
+from v_atx_crime
+where ucr_category is not null
+group by 1
+order by 1;
+
+-- FBI's UCR category by zip code
+select zip_code,
+	count(*) filter(where category_description = 'Aggravated Assault') as aggrevated_assault,
+	count(*) filter(where category_description = 'Auto Theft') as auto_theft,
+	count(*) filter(where category_description = 'Burglary') as burglary,
+	count(*) filter(where category_description = 'Murder') as murder,
+	count(*) filter(where category_description = 'Rape') as rape,
+	count(*) filter(where category_description = 'Robbery') as robbery,
+	count(*) filter(where category_description = 'Theft') as theft
+from v_atx_crime
+group by 1;
+
+-- Days to clear a crime for top 25 crimes reported
+select a.highest_offense_description,
+	(round(extract(epoch from min(clearance_date - report_date) / 86400),0)||' days') as min_days, -- Formatting 00:00:00 to '0 days'
 	max(clearance_date - report_date) as max_days,
 	avg(clearance_date - report_date) as avg_days,
 	percentile_disc(0.5) within group (order by (clearance_date - report_date)) as median_days
-FROM austin_crime
-WHERE clearance_date is not null;
+from v_atx_crime a left join (
+	select highest_offense_description, 
+		count(*)
+	from v_atx_crime
+	group by highest_offense_description
+	order by 2 desc
+	limit 25) b on a.highest_offense_description = b.highest_offense_description
+where coalesce(clearance_status, 'N') <> 'N'
+	and b.highest_offense_description is not null
+group by a.highest_offense_description;
 
+-- Days to clear a crime by FBI UCR category
+select category_description as fbi_ucr_category,
+	min(clearance_date - report_date) as min_days,
+	max(clearance_date - report_date) as max_days,
+	avg(clearance_date - report_date) as avg_days,
+	percentile_disc(0.5) within group (order by (clearance_date - report_date)) as median_days
+from v_atx_crime
+where coalesce(clearance_status, 'N') <> 'N'
+	and ucr_category is not null
+group by 1;
 
-/* If there's a significant amount null values for a column, imputation might be helpful. 
-In this scenario, the amount of null records is very small, which might not be noticeable if we analyze the dataset as a whole, but it might be useful if we break it down by features */
-
--- # of rows where occurred_date_time is null: 7
-SELECT count(*)
-FROM austin_crime
-WHERE occurred_date_time is null;
-
-
--- Imputing the missing occurred_date_time with the median datetime by year and offense code
-WITH median_occ_time AS (
-SELECT extract(year from occurred_date) as year,
-	highest_offense_code,
-	-- Calculate the median timestamp for occurred_date_time by year and offense code
-	to_char(to_timestamp(percentile_disc(0.5) within group(order by extract(epoch from occurred_date_time::time)::int)) AT TIME ZONE 'UTC', 'HH24:MI:SS') as occ_timestamp
-FROM austin_crime
-GROUP BY 1, 2
-) SELECT incident_number,
-	a.highest_offense_code,
-	highest_offense_description,
-	report_date,
-	report_date_time,
-	occurred_date,
-	-- Replace null occurred_date_time values with a occurred date + the median time calculated from the previous CTE
-	coalesce(occurred_date_time,
-		to_timestamp(concat(to_char(occurred_date, 'YYYY-MM-DD'), ' ', b.occ_timestamp), 'YYYY-MM-DD HH24:MI:SS')::timestamp) as occurred_date_time 
-FROM austin_crime a LEFT JOIN median_occ_time b ON a.highest_offense_code = b.highest_offense_code 
-	AND extract(year from a.occurred_date) = b.year
-WHERE incident_number IN ( -- Validating the 7 records with null values
-	SELECT incident_number
-	FROM austin_crime
-	WHERE occurred_date_time is null
-);
-
-/* Creating a summary statistic table to describe the time elapsed from the crime occurring to being reported */
-WITH median_occ_time AS (
-SELECT extract(year from occurred_date) as year,
-	highest_offense_code,
-	to_char(to_timestamp(percentile_cont(0.5) within group(order by extract(epoch from occurred_date_time::time)::int)) AT TIME ZONE 'UTC', 'HH24:MI:SS') as occ_timestamp
-FROM austin_crime
-GROUP BY 1, 2
-), dataset as (
-SELECT incident_number,
-	a.highest_offense_code,
-	highest_offense_description,
-	report_date,
-	report_date_time,
-	occurred_date,
-	coalesce(occurred_date_time,
-		to_timestamp(concat(to_char(occurred_date, 'YYYY-MM-DD'), ' ', b.occ_timestamp), 'YYYY-MM-DD HH24:MI:SS')::timestamp) as occurred_date_time
-FROM austin_crime a LEFT JOIN median_occ_time b ON a.highest_offense_code = b.highest_offense_code 
-	AND extract(year from a.occurred_date) = b.year
-), stats_offense as (
--- Calculate summary statistics for the length of time (in days) elapsed from the incident occurring to the time it was reported
-SELECT highest_offense_description,
+-- Summary days elapsed to clear crime by FBI UCR categories
+with stat_summary as (
+select category_description,
 	count(*) as offense_count,
-	round(max(days_length),2) as max_days,
-	round(min(days_length),2) as min_days,
-	round(avg(days_length), 2) as avg_days,
+	max(days_length) as max_days,
+	min(days_length) as min_days,
+	round(avg(days_length),2) as avg_days,
 	round(stddev_pop(days_length), 2) as std_days,
-	round((percentile_cont(0.25) within group (order by days_length))::numeric, 2) as q25_days,
-	round((percentile_cont(0.5) within group (order by days_length))::numeric, 2) as q50_days,
-	round((percentile_cont(0.75) within group (order by days_length))::numeric, 2) as q75_days
-FROM (
-	SELECT highest_offense_description,
-		extract(epoch from (report_date_time - occurred_date_time)) / 86400 as days_length
-	FROM dataset) 
-GROUP BY highest_offense_description
-)SELECT t.*,
+	percentile_cont(0.25) within group (order by days_length)::numeric as q25_days,
+	percentile_cont(0.5) within group (order by days_length)::numeric as q50_days,
+	percentile_cont(0.75) within group (order by days_length)::numeric as q75_days
+from (
+	select category_description,
+		extract(day from clearance_date - report_date) as days_length
+	from v_atx_crime
+	where coalesce(clearance_status, 'N') <> 'N'
+		and ucr_category is not null
+	) group by category_description
+)select t.*,
 -- Calculating IQR can be used to roughly describe how the length of days are distributed
 	(q75_days - q25_days) as iqr,
 	q25_days - 1.5 * (q75_days-q25_days) as q1,
 	q75_days + 1.5 * (q75_days-q25_days) as q3
-FROM stats_offense t;
+from stat_summary t;
 
-
-/* Create a view with the features we need */
-CREATE OR REPLACE VIEW v_atx2018_crime AS
-WITH median_occ_time AS (
-SELECT extract(year from occurred_date) as year,
-	highest_offense_code,
-	to_char(to_timestamp(percentile_cont(0.5) within group(order by extract(epoch from occurred_date_time::time)::int)) AT TIME ZONE 'UTC', 'HH24:MI:SS') as occ_timestamp
-FROM austin_crime
-GROUP BY 1, 2
-) SELECT incident_number,
-highest_offense_description,
-upper(family_violence) as family_violence,
-occurred_date,
-coalesce(occurred_date_time, to_timestamp(concat(to_char(occurred_date, 'YYYY-MM-DD'), ' ', b.occ_timestamp), 'YYYY-MM-DD HH24:MI:SS')::timestamp) as occurred_date_time,
-report_date,
-report_date_time,
-location_type,
-zip_code,
-clearance_status,
-clearance_date,
-category_description as ucr_category,
-x_coordinate as latitude,
-y_coordinate as longitude
-FROM austin_crime a LEFT JOIN median_occ_time b ON a.highest_offense_code = b.highest_offense_code
-	AND extract(year from occurred_date) = b.year
-WHERE extract(year from report_date) >= 2018;
+-- Summary days elapsed to clear crime by year
+with stat_summary as (
+select year,
+	count(*) as offense_count,
+	max(days_length) as max_days,
+	min(days_length) as min_days,
+	avg(days_length) as avg_days,
+	round(stddev_pop(days_length), 2) as std_days,
+	percentile_cont(0.25) within group (order by days_length)::numeric as q25_days,
+	percentile_cont(0.5) within group (order by days_length)::numeric as q50_days,
+	percentile_cont(0.75) within group (order by days_length)::numeric as q75_days
+from (
+	select incident_number,
+		extract(year from report_date) as year,
+		extract(day from clearance_date - report_date) as days_length
+	from v_atx_crime
+	where coalesce(clearance_status, 'N') <> 'N'
+	) group by year
+)select t.*,
+-- Calculating IQR can be used to roughly describe how the length of days are distributed
+	(q75_days - q25_days) as iqr,
+	q25_days - 1.5 * (q75_days-q25_days) as q1,
+	q75_days + 1.5 * (q75_days-q25_days) as q3
+from stat_summary t;
