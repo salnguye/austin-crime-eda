@@ -1,5 +1,5 @@
 # Objective
-In this project, I will be exploring Austin Texas’s crime reports from 2008 to March 2024 to summarize key characteristics of the dataset and find patterns that exists within it. Univariate non-graphical is an EDA method that will be used for this analysis.
+In this project, I will be exploring Austin Texas’s crime reports from March 1st, 2014 to March 25th, 2024 to summarize key characteristics of the dataset and find patterns that exists within it. Univariate non-graphical is an EDA method that will be used for this analysis.
 
 <p>
 
